@@ -45,6 +45,92 @@ def markov_form(results):
     score = max(0.0, min(1.0, (pi[GOOD] - pi[POOR] + 1) / 2))
     return score, T, pi
 
+# ── Bayes' Theorem ─────────────────────────────────────────────
+# We compute P(win | form_state) for each Markov state.
+#
+# Bayes' Theorem:
+#   P(win | state) = P(state | win) × P(win) / P(state)
+#
+# Where:
+#   P(win)         = base win rate from historical results
+#   P(state | win) = fraction of wins that were preceded by 'state'
+#   P(state)       = π_state from the stationary distribution
+#
+# This lets us use form as *evidence* to update our win probability,
+# rather than just averaging it in as a flat weight.
+
+def compute_bayes(results, pi):
+    """
+    Given the ordered list of results (most-recent first) and the
+    stationary distribution pi, return:
+      - p_win_given_state: dict mapping state index -> P(win | state)
+      - p_state_given_win: dict mapping state index -> P(state | win)  [the likelihood]
+      - p_win:             base win rate (prior)
+      - bayes_details:     dict of all components for display
+    """
+    n = len(results)
+    if n < 3:
+        uniform = {GOOD: 1/3, NEUTRAL: 1/3, POOR: 1/3}
+        p_win = 0.5
+        return (
+            {GOOD: 0.5, NEUTRAL: 0.5, POOR: 0.5},
+            uniform, p_win,
+            {"note": "insufficient data"}
+        )
+
+    # P(win) — the prior
+    p_win = results.count("W") / n
+
+    # Count how often each Markov state preceded a win / any result
+    state_before_win   = [0, 0, 0]   # numerator counts
+    state_before_any   = [0, 0, 0]   # denominator counts
+
+    # Walk oldest → newest so idx+1 is the *previous* game
+    # results[0] = most recent, results[-1] = oldest
+    # We look at results[i] (the outcome) and the Markov state
+    # formed by results[i] and results[i+1] (the two games before it)
+    for i in range(n - 2):
+        outcome = results[i]               # the game we're predicting into
+        state   = classify(results, i + 1) # state formed by the game before + the one before that
+        state_before_any[state] += 1
+        if outcome == "W":
+            state_before_win[state] += 1
+
+    # P(state | win)  — likelihood
+    total_wins_with_context = sum(state_before_win)
+    if total_wins_with_context == 0:
+        p_state_given_win = {GOOD: 1/3, NEUTRAL: 1/3, POOR: 1/3}
+    else:
+        p_state_given_win = {
+            s: state_before_win[s] / total_wins_with_context
+            for s in (GOOD, NEUTRAL, POOR)
+        }
+
+    # P(state) — the marginal, taken from the stationary distribution
+    # (this is the long-run probability of being in each state)
+    p_state = {GOOD: pi[GOOD], NEUTRAL: pi[NEUTRAL], POOR: pi[POOR]}
+
+    # Bayes update: P(win | state) = P(state | win) × P(win) / P(state)
+    # Clamp to [0,1] for robustness with small samples
+    p_win_given_state = {}
+    for s in (GOOD, NEUTRAL, POOR):
+        denom = p_state[s]
+        if denom < 1e-9:
+            p_win_given_state[s] = p_win
+        else:
+            raw = (p_state_given_win[s] * p_win) / denom
+            p_win_given_state[s] = max(0.0, min(1.0, raw))
+
+    bayes_details = {
+        "p_win":             p_win,
+        "p_state_given_win": p_state_given_win,
+        "p_state":           p_state,
+        "p_win_given_state": p_win_given_state,
+        "state_counts_win":  state_before_win,
+        "state_counts_any":  state_before_any,
+    }
+    return p_win_given_state, p_state_given_win, p_win, bayes_details
+
 # ── Stats ─────────────────────────────────────────────────────
 def compute_stats(matches, team_id):
     results, home_r, away_r, gf_list, ga_list = [], [], [], [], []
@@ -66,28 +152,58 @@ def compute_stats(matches, team_id):
     if n == 0: return None
     def rate(lst, v): return lst.count(v) / len(lst) if lst else 0.0
     mk_score, mk_T, mk_pi = markov_form(results)
+
+    # Compute Bayes posteriors from this team's history
+    p_win_given_state, p_state_given_win, p_win_prior, bayes_details = compute_bayes(results, mk_pi)
+
+    # Determine the team's *current* Markov state (from the 2 most recent results)
+    current_state = classify(results, 0) if len(results) >= 2 else NEUTRAL
+
     return {
         "total_games": n, "win_rate": rate(results, "W"), "draw_rate": rate(results, "D"),
         "home_win_rate": rate(home_r, "W") if home_r else 0.45,
         "away_win_rate": rate(away_r, "W") if away_r else 0.30,
         "avg_goals_scored": sum(gf_list) / n, "avg_goals_conceded": sum(ga_list) / n,
         "recent_form": results[:10], "form_score": mk_score, "markov_T": mk_T, "markov_pi": mk_pi,
+        # Bayes additions
+        "current_state":      current_state,
+        "p_win_given_state":  p_win_given_state,
+        "p_state_given_win":  p_state_given_win,
+        "p_win_prior":        p_win_prior,
+        "bayes_details":      bayes_details,
     }
 
 # ── Prediction ────────────────────────────────────────────────
 def predict(hs, as_, h2h_matches, home_id):
     base_h = hs["home_win_rate"]; base_a = as_["away_win_rate"]
     base_d = max(0.05, 1 - base_h - base_a)
+
+    # ── Markov form factor (unchanged) ────────────────────────
     tf = hs["form_score"] + as_["form_score"]
     form_h = hs["form_score"] / tf * 0.75 if tf > 0 else 0.45
     form_a = as_["form_score"] / tf * 0.75 if tf > 0 else 0.30
     form_d = max(0.05, 1 - form_h - form_a)
+
+    # ── Bayes factor ─────────────────────────────────────────
+    # Replace raw form_score with P(win | current Markov state)
+    # This is the Bayesian-updated win probability given observed form state.
+    bayes_h = hs["p_win_given_state"][hs["current_state"]]
+    bayes_a = as_["p_win_given_state"][as_["current_state"]]
+    # Normalise so they compete as home-win / away-win probabilities
+    bayes_sum = bayes_h + bayes_a
+    bayes_ph  = bayes_h / bayes_sum * 0.75 if bayes_sum > 0 else 0.45
+    bayes_pa  = bayes_a / bayes_sum * 0.75 if bayes_sum > 0 else 0.30
+    bayes_pd  = max(0.05, 1 - bayes_ph - bayes_pa)
+
+    # ── xG factor ────────────────────────────────────────────
     xg_h = (hs["avg_goals_scored"] + as_["avg_goals_conceded"]) / 2
     xg_a = (as_["avg_goals_scored"] + hs["avg_goals_conceded"]) / 2
     gd = xg_h - xg_a
     p_xg_h = max(0.05, min(0.80, 0.45 + gd * 0.08))
     p_xg_a = max(0.05, min(0.70, 0.30 - gd * 0.06))
     p_xg_d = max(0.05, 1 - p_xg_h - p_xg_a)
+
+    # ── H2H factor ───────────────────────────────────────────
     hw = hd = ha = 0
     for m in h2h_matches[:10]:
         ft = m.get("score", {}).get("fullTime", {})
@@ -103,24 +219,54 @@ def predict(hs, as_, h2h_matches, home_id):
             else: ha += 1
     hn = hw + hd + ha
     h2h_h, h2h_d, h2h_a = (hw/hn, hd/hn, ha/hn) if hn > 0 else (0.45, 0.25, 0.30)
-    W = 0.25
-    rh = W*base_h + W*form_h + W*p_xg_h + W*h2h_h
-    ra = W*base_a + W*form_a + W*p_xg_a + W*h2h_a
-    rd = W*base_d + W*form_d + W*p_xg_d + W*h2h_d
+
+    # ── Blend: Base 25%, Markov Form 20%, Bayes 20%, xG 20%, H2H 15% ──
+    # (Bayes replaces one quarter of what was "form weight" and gets its own slot)
+    W_base  = 0.25
+    W_form  = 0.20
+    W_bayes = 0.20
+    W_xg    = 0.20
+    W_h2h   = 0.15
+
+    rh = W_base*base_h + W_form*form_h + W_bayes*bayes_ph + W_xg*p_xg_h + W_h2h*h2h_h
+    ra = W_base*base_a + W_form*form_a + W_bayes*bayes_pa + W_xg*p_xg_a + W_h2h*h2h_a
+    rd = W_base*base_d + W_form*form_d + W_bayes*bayes_pd + W_xg*p_xg_d + W_h2h*h2h_d
     t = rh + ra + rd
     ph, pa, pd = rh/t, ra/t, rd/t
+
     if ph >= pa and ph >= pd: winner, conf = "home", ph
     elif pa >= ph and pa >= pd: winner, conf = "away", pa
     else: winner, conf = "draw", pd
+
     return {
         "winner": winner, "confidence": conf,
         "home_win": ph, "draw": pd, "away_win": pa,
         "xg_h": xg_h, "xg_a": xg_a,
         "h2h": f"{hw}W-{hd}D-{ha}L", "h2h_games": hn,
         "factors": {
-            "Base Win Rate": (base_h, base_a), "Markov Form": (form_h, form_a),
-            "xG Model": (p_xg_h, p_xg_a), "Head to Head": (h2h_h, h2h_a),
-        }
+            "Base Win Rate":  (base_h,   base_a),
+            "Markov Form":    (form_h,   form_a),
+            "Bayes P(W|state)":(bayes_ph, bayes_pa),
+            "xG Model":       (p_xg_h,   p_xg_a),
+            "Head to Head":   (h2h_h,    h2h_a),
+        },
+        # Raw Bayes numbers for the educational display
+        "bayes_h": {
+            "p_win":             hs["p_win_prior"],
+            "current_state":     hs["current_state"],
+            "p_state_given_win": hs["p_state_given_win"][hs["current_state"]],
+            "p_state":           hs["markov_pi"][hs["current_state"]],
+            "p_win_given_state": hs["p_win_given_state"][hs["current_state"]],
+            "all_posteriors":    hs["p_win_given_state"],
+        },
+        "bayes_a": {
+            "p_win":             as_["p_win_prior"],
+            "current_state":     as_["current_state"],
+            "p_state_given_win": as_["p_state_given_win"][as_["current_state"]],
+            "p_state":           as_["markov_pi"][as_["current_state"]],
+            "p_win_given_state": as_["p_win_given_state"][as_["current_state"]],
+            "all_posteriors":    as_["p_win_given_state"],
+        },
     }
 
 # ── ANSI helpers ──────────────────────────────────────────────
@@ -143,6 +289,7 @@ def mini_bar(val, width=20):
     return f"{'█'*filled}{'░'*(width-filled)}"
 
 def divider(w=60): return f"{GY}{'─'*w}{RESET}"
+def thin(w=50):    return f"{GY}{'·'*w}{RESET}"
 
 async def send(ws, text): await ws.send_text(text + "\r\n")
 async def send_raw(ws, text): await ws.send_text(text)
@@ -210,6 +357,60 @@ class Session:
             except ValueError: pass
             await send(self.ws, f"  {RD}Invalid.{RESET}")
 
+    async def print_bayes_section(self, team_name, col, bayes, team_stats):
+        """Print the full Bayes' Theorem educational breakdown for one team."""
+        ws = self.ws
+        state_idx  = bayes["current_state"]
+        state_name = STATE_NAMES[state_idx]
+        state_cols = [GR, GY, RD]
+        sc         = state_cols[state_idx]
+
+        p_win   = bayes["p_win"]
+        p_sg_w  = bayes["p_state_given_win"]
+        p_s     = bayes["p_state"]
+        p_wg_s  = bayes["p_win_given_state"]
+
+        await send(ws, f"\r\n  {col}{BOLD}{team_name}{RESET}  {GY}current state →{RESET} {sc}{BOLD}{state_name}{RESET}")
+
+        # Formula line
+        await send(ws, f"")
+        await send(ws, f"  {GY}  Bayes' Theorem:{RESET}")
+        await send(ws, f"  {WH}  P(win | {state_name}) = P({state_name} | win) × P(win) / P({state_name}){RESET}")
+        await send(ws, f"")
+
+        # Values
+        num_str   = f"{p_sg_w:.3f} × {p_win:.3f}"
+        denom_str = f"{p_s:.3f}"
+        post_str  = f"{p_wg_s:.3f}  ({p_wg_s*100:.1f}%)"
+        prior_str = f"{p_win:.3f}  ({p_win*100:.1f}%)"
+
+        await send(ws, f"  {GY}  P(win)              [prior]      = {WH}{prior_str}{RESET}")
+        await send(ws, f"  {GY}  P({state_name:<7} | win)  [likelihood] = {WH}{p_sg_w:.3f}  ({p_sg_w*100:.1f}%){RESET}")
+        await send(ws, f"  {GY}  P({state_name:<7})         [marginal]   = {WH}{p_s:.3f}  ({p_s*100:.1f}%){RESET}")
+        await send(ws, f"  {GY}  ─────────────────────────────────{RESET}")
+
+        # Show the arithmetic
+        if p_s > 1e-9:
+            product = p_sg_w * p_win
+            await send(ws, f"  {GY}    ({num_str}) / {denom_str}{RESET}")
+            await send(ws, f"  {GY}  = {product:.4f} / {denom_str}{RESET}")
+        await send(ws, f"  {GY}  P(win | {state_name:<7}) [posterior]  = {GR}{BOLD}{post_str}{RESET}")
+
+        # Prior → Posterior update visual
+        delta = p_wg_s - p_win
+        arrow = f"{GR}▲ +{delta*100:.1f}%" if delta > 0.005 else (f"{RD}▼ {delta*100:.1f}%" if delta < -0.005 else f"{GY}≈ ~0%")
+        await send(ws, f"  {GY}  Belief update: {WH}{p_win*100:.1f}%{GY} → {GR}{p_wg_s*100:.1f}%{GY}  [{arrow}{GY}]{RESET}")
+
+        # Table: P(win | state) for all 3 states
+        await send(ws, f"")
+        await send(ws, f"  {GY}  All posterior win probabilities:{RESET}")
+        await send(ws, f"  {GY}  {'State':<10}  {'P(win|state)':>14}  {'bar'}{RESET}")
+        for s, (sn, sc2) in enumerate(zip(STATE_NAMES, state_cols)):
+            pws = bayes["all_posteriors"][s]
+            bar = mini_bar(pws, 16)
+            marker = f" {WH}← current{RESET}" if s == state_idx else ""
+            await send(ws, f"  {sc2}  {sn:<10}{RESET}  {WH}{pws*100:>6.1f}%{RESET}  {sc2}{bar}{RESET}{marker}")
+
     async def print_result(self, home_name, away_name, hs, as_, result):
         ws = self.ws
         ph = result["home_win"]*100; pd = result["draw"]*100; pa = result["away_win"]*100
@@ -219,25 +420,38 @@ class Session:
         await send(ws, f"  {c(CY,home_name,True)}  vs  {c(RD,away_name,True)}")
         await send(ws, divider())
 
+        # ── Win probability ───────────────────────────────────
         await send(ws, f"\r\n  {BOLD}{WH}WIN PROBABILITY{RESET}")
         await send(ws, f"  {prob_bar(ph, pd, pa)}")
         await send(ws, f"  {CY}{home_name:<24}{ph:>5.1f}%{RESET}")
         await send(ws, f"  {GY}{'Draw':<24}{pd:>5.1f}%{RESET}")
         await send(ws, f"  {RD}{away_name:<24}{pa:>5.1f}%{RESET}")
 
+        # ── Prediction ────────────────────────────────────────
         await send(ws, f"\r\n  {BOLD}{WH}PREDICTION{RESET}")
         if result["winner"]=="home": label=f"{GR}{BOLD}{home_name}{RESET}"
         elif result["winner"]=="away": label=f"{GR}{BOLD}{away_name}{RESET}"
         else: label=f"{YL}{BOLD}Draw{RESET}"
         await send(ws, f"  {label}  {GY}({result['confidence']*100:.1f}% confidence){RESET}")
 
-        await send(ws, f"\r\n  {BOLD}{WH}CONDITIONAL PROBABILITY FACTORS{RESET}  {GY}(25% each){RESET}")
-        cols = [CY, GR, YL, PU]
+        # ── Conditional probability factors ───────────────────
+        await send(ws, f"\r\n  {BOLD}{WH}CONDITIONAL PROBABILITY FACTORS{RESET}  {GY}(weights: base 25% · form 20% · bayes 20% · xG 20% · h2h 15%){RESET}")
+        cols = [CY, GR, PU, YL, GR]
         for (fname, (fh, fa)), col in zip(result["factors"].items(), cols):
             arrow = f"{CY}←{RESET}" if fh>fa else (f"{RD}→{RESET}" if fa>fh else "=")
             hbar=mini_bar(fh,10); abar=mini_bar(fa,10)
-            await send(ws, f"  {col}{fname:<16}{RESET}  {CY}{hbar} {fh*100:>4.1f}%{RESET}  {arrow}  {RD}{abar} {fa*100:>4.1f}%{RESET}")
+            await send(ws, f"  {col}{fname:<20}{RESET}  {CY}{hbar} {fh*100:>4.1f}%{RESET}  {arrow}  {RD}{abar} {fa*100:>4.1f}%{RESET}")
 
+        # ── Bayes' Theorem breakdown ──────────────────────────
+        await send(ws, f"\r\n  {BOLD}{WH}BAYES' THEOREM  —  P(win | Markov form state){RESET}")
+        await send(ws, f"  {GY}Using form state as *evidence* to update the win probability prior.{RESET}")
+        await send(ws, f"  {GY}Formula:  P(win|state) = P(state|win) × P(win)  /  P(state){RESET}")
+
+        await self.print_bayes_section(home_name, CY, result["bayes_h"], hs)
+        await send(ws, thin())
+        await self.print_bayes_section(away_name, RD, result["bayes_a"], as_)
+
+        # ── Markov chain model ────────────────────────────────
         await send(ws, f"\r\n  {BOLD}{WH}MARKOV CHAIN FORM MODEL{RESET}")
         await send(ws, f"  {GY}States: {GR}GOOD{GY}=2 consecutive wins  NEUTRAL=mixed  {RD}POOR{GY}=2 consecutive losses{RESET}")
         for name, stats, col in [(home_name, hs, CY), (away_name, as_, RD)]:
@@ -262,10 +476,12 @@ class Session:
                     else: cells.append(f"{GY}{val_str:>8}{RESET}")
                 await send(ws, f"    {sc}{sn:<10}{RESET}  {'  '.join(cells)}")
 
+        # ── Recent form ───────────────────────────────────────
         await send(ws, f"\r\n  {BOLD}{WH}RECENT FORM{RESET}  {GY}(last 10){RESET}")
         await send(ws, f"  {CY}{home_name[:20]:<20}{RESET}  {' '.join(form_char(r) for r in hs['recent_form'])}")
         await send(ws, f"  {RD}{away_name[:20]:<20}{RESET}  {' '.join(form_char(r) for r in as_['recent_form'])}")
 
+        # ── Stats summary ─────────────────────────────────────
         await send(ws, f"\r\n  {BOLD}{WH}STATS{RESET}  {GY}(last {hs['total_games']} / {as_['total_games']} games){RESET}")
         rows = [
             ("Win Rate",      f"{hs['win_rate']*100:.0f}%",     f"{as_['win_rate']*100:.0f}%"),
@@ -283,7 +499,7 @@ class Session:
     async def run(self):
         ws = self.ws
         await send(ws, f"\r\n{CY}{BOLD}  Premier League Match Predictor{RESET}")
-        await send(ws, f"{GY}  Markov chain form · last {GAME_WINDOW} games{RESET}\r\n")
+        await send(ws, f"{GY}  Markov chain form · Bayes' Theorem · last {GAME_WINDOW} games{RESET}\r\n")
         await send(ws, f"{GY}  Loading teams...{RESET}")
         try:
             await self.load_teams()
@@ -379,7 +595,7 @@ HTML = """<!DOCTYPE html>
 <body>
 <div id="header">
   <span class="badge">PL Predictor</span>
-  <span class="title">football-data.org · Markov Chain Form Model</span>
+  <span class="title">football-data.org · Markov Chain · Bayes' Theorem</span>
 </div>
 <div id="terminal-wrap">
   <div id="terminal"></div>
